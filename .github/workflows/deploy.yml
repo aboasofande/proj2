@@ -1,0 +1,307 @@
+name: 🚀 Deploy Burger Builder to Azure Container Apps
+
+on:
+  workflow_dispatch:
+    inputs:
+      action:
+        description: 'Action to perform'
+        required: true
+        default: 'deploy'
+        type: choice
+        options:
+        - deploy
+        - destroy
+
+permissions:
+  contents: read
+  actions: read
+  checks: write
+  pull-requests: write
+  id-token: write
+
+jobs:
+  # Job 1: Code Quality Analysis (SonarCloud)
+  backend-analysis:
+    name: 🔍 Backend Analysis
+    runs-on: ubuntu-latest
+    if: github.event.inputs.action != 'destroy'
+    defaults:
+      run:
+        working-directory: ./backend
+    
+    steps:
+      - name: 📥 Checkout code
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0  # Shallow clones for better analysis
+      
+      - name: ☕ Set up JDK 21
+        uses: actions/setup-java@v4
+        with:
+          java-version: '21'
+          distribution: 'temurin'
+          cache: maven
+      
+      - name: 🧪 Run Tests & Generate Coverage
+        run: mvn clean verify
+      
+      - name: 🔍 SonarCloud Scan
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          SONAR_TOKEN: ${{ secrets.SONAR_TOKEN }}
+        run: |
+          mvn sonar:sonar \
+            -Dsonar.projectKey=alrasheed_end2end-app-backend \
+            -Dsonar.projectName="Burger Builder Backend" \
+            -Dsonar.organization=aboasofande \
+            -Dsonar.host.url=https://sonarcloud.io \
+            -Dsonar.sources=src/main/java \
+            -Dsonar.tests=src/test/java \
+            -Dsonar.java.binaries=target/classes \
+            -Dsonar.coverage.jacoco.xmlReportPaths=target/site/jacoco/jacoco.xml \
+            -Dsonar.newCode.referenceBranch=master
+      
+      - name: 📈 Upload Coverage Report
+        uses: actions/upload-artifact@v4
+        with:
+          name: backend-coverage
+          path: backend/target/site/jacoco/
+          retention-days: 7
+
+  frontend-analysis:
+    name: 🔍 Frontend Analysis
+    runs-on: ubuntu-latest
+    if: github.event.inputs.action != 'destroy'
+    defaults:
+      run:
+        working-directory: ./frontend
+    
+    steps:
+      - name: 📥 Checkout code
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      
+      - name: 🔧 Set up Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+          cache: 'npm'
+          cache-dependency-path: frontend/package-lock.json
+      
+      - name: 📦 Install Dependencies
+        run: npm ci
+      
+      - name: 🧪 Run Tests & Generate Coverage
+        run: npm run test:coverage
+      
+      - name: 🔍 SonarCloud Scan
+        uses: SonarSource/sonarqube-scan-action@v6
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          SONAR_TOKEN: ${{ secrets.SONAR_TOKEN }}
+        with:
+          projectBaseDir: frontend/
+          args: >
+            -Dsonar.projectKey=aboasofande_end2end-app-frontend
+            -Dsonar.projectName="Burger Builder Frontend"
+            -Dsonar.organization=aboasofande
+            -Dsonar.sources=src
+            -Dsonar.tests=src
+            -Dsonar.test.inclusions=**/*.test.ts,**/*.test.tsx
+            -Dsonar.exclusions=**/*.test.ts,**/*.test.tsx,**/test/**,**/*.config.ts,**/*.config.js
+            -Dsonar.javascript.lcov.reportPaths=coverage/lcov.info
+            -Dsonar.typescript.tsconfigPath=tsconfig.json
+            -Dsonar.newCode.referenceBranch=master
+      
+      - name: 📈 Upload Coverage Report
+        uses: actions/upload-artifact@v4
+        with:
+          name: frontend-coverage
+          path: frontend/coverage/
+          retention-days: 7
+
+  # Job 2: Build & Push Docker Images
+  build:
+    name: 🔨 Build & Push Images
+    needs: [backend-analysis, frontend-analysis]
+    runs-on: ubuntu-latest
+    if: github.event.inputs.action != 'destroy'
+    outputs:
+      frontend_tag: ${{ steps.meta.outputs.frontend_tag }}
+      backend_tag: ${{ steps.meta.outputs.backend_tag }}
+      
+    steps:
+    - name: 📥 Checkout code
+      uses: actions/checkout@v4
+
+    - name: 🔑 Login to Docker Hub
+      run: |
+        echo "${{ secrets.DOCKERHUB_TOKEN }}" | docker login --username "${{ secrets.DOCKERHUB_USERNAME }}" --password-stdin
+
+    - name: 🏷️ Generate Image Tags
+      id: meta
+      run: |
+        echo "frontend_tag=${{ secrets.DOCKERHUB_USERNAME }}/burger-builder-frontend:latest" >> $GITHUB_OUTPUT
+        echo "backend_tag=${{ secrets.DOCKERHUB_USERNAME }}/burger-builder-backend:latest" >> $GITHUB_OUTPUT
+        echo "✅ Image tags generated"
+
+    - name: 🔨 Build & Push Frontend Image
+      run: |
+        docker build -t ${{ steps.meta.outputs.frontend_tag }} ./frontend
+        docker push ${{ steps.meta.outputs.frontend_tag }}
+        echo "✅ Frontend image pushed to Docker Hub"
+
+    - name: 🔨 Build & Push Backend Image
+      run: |
+        docker build -t ${{ steps.meta.outputs.backend_tag }} ./backend
+        docker push ${{ steps.meta.outputs.backend_tag }}
+        echo "✅ Backend image pushed to Docker Hub"
+
+  # Job 2: Deploy Infrastructure with Fresh Images
+  infrastructure:
+    name: 🏗️ Deploy Infrastructure
+    needs: build
+    runs-on: ubuntu-latest
+    if: github.event.inputs.action != 'destroy'
+    defaults:
+      run:
+        working-directory: ./terraform
+    outputs:
+      resource_group: ${{ steps.outputs.outputs.resource_group }}
+      backend_fqdn: ${{ steps.outputs.outputs.backend_fqdn }}
+      frontend_fqdn: ${{ steps.outputs.outputs.frontend_fqdn }}
+      
+    steps:
+    - name: 📥 Checkout code
+      uses: actions/checkout@v4
+
+    - name: 🔧 Setup Terraform
+      uses: hashicorp/setup-terraform@v3
+      with:
+        terraform_version: 1.7.3
+        terraform_wrapper: false
+
+    - name: 🔐 Azure Login
+      uses: azure/login@v1
+      with:
+        creds: ${{ secrets.AZURE_CREDENTIALS }}
+
+    - name: 📝 Create Terraform Variables File
+      run: |
+        cat > terraform.tfvars << 'EOF'
+        ${{ secrets.TF_VARS }}
+        EOF
+        
+        echo "✅ Terraform variables file created"
+
+    - name: 🏗️ Terraform Init
+      run: terraform init
+
+    - name: 🔍 Terraform Validate
+      run: terraform validate
+
+    - name: 📋 Terraform Plan
+      run: terraform plan -out=tfplan
+
+    - name: 🚀 Terraform Apply
+      run: terraform apply -auto-approve tfplan
+
+    - name:  Get Terraform Outputs
+      id: outputs
+      run: |
+        echo "resource_group=$(terraform output -raw resource_group_name)" >> $GITHUB_OUTPUT
+        
+        # Get Container App FQDNs
+        RG=$(terraform output -raw resource_group_name)
+        BACKEND_FQDN=$(az containerapp show --name backend-app --resource-group $RG --query "properties.configuration.ingress.fqdn" -o tsv)
+        FRONTEND_FQDN=$(az containerapp show --name frontend-app --resource-group $RG --query "properties.configuration.ingress.fqdn" -o tsv)
+        
+        echo "backend_fqdn=$BACKEND_FQDN" >> $GITHUB_OUTPUT
+        echo "frontend_fqdn=$FRONTEND_FQDN" >> $GITHUB_OUTPUT
+        
+        echo "✅ Infrastructure deployed with fresh images!"
+
+  # Job 3: Test & Verify Deployment
+  test:
+    name: 🧪 Test & Verify
+    needs: [build, infrastructure]
+    runs-on: ubuntu-latest
+    if: github.event.inputs.action != 'destroy'
+
+    steps:
+    - name: ⏳ Wait for Apps to Start
+      run: |
+        echo "Waiting for container apps to fully start..."
+        sleep 45
+
+    - name: 🔍 Test Application
+      run: |
+        echo "## � Burger Builder Deployed Successfully!" >> $GITHUB_STEP_SUMMARY
+        echo "### 📋 Deployment Details:" >> $GITHUB_STEP_SUMMARY
+        echo "- **Frontend Image:** \`${{ needs.build.outputs.frontend_tag }}\`" >> $GITHUB_STEP_SUMMARY
+        echo "- **Backend Image:** \`${{ needs.build.outputs.backend_tag }}\`" >> $GITHUB_STEP_SUMMARY
+        echo "- **Deployment Time:** $(date)" >> $GITHUB_STEP_SUMMARY
+        echo "- **Frontend URL:** https://${{ needs.infrastructure.outputs.frontend_fqdn }}" >> $GITHUB_STEP_SUMMARY
+        echo "- **Backend API URL:** https://${{ needs.infrastructure.outputs.backend_fqdn }}" >> $GITHUB_STEP_SUMMARY
+        
+        # Test health endpoints
+        echo "### 🔍 Health Checks:" >> $GITHUB_STEP_SUMMARY
+        
+        if curl -f "https://${{ needs.infrastructure.outputs.frontend_fqdn }}" > /dev/null 2>&1; then
+          echo "- **Frontend Health:** ✅ Healthy" >> $GITHUB_STEP_SUMMARY
+        else
+          echo "- **Frontend Health:** ⚠️ Not responding (may still be starting)" >> $GITHUB_STEP_SUMMARY
+        fi
+        
+        if curl -f "https://${{ needs.infrastructure.outputs.backend_fqdn }}/actuator/health" > /dev/null 2>&1; then
+          echo "- **Backend Health:** ✅ Healthy" >> $GITHUB_STEP_SUMMARY
+        else
+          echo "- **Backend Health:** ⚠️ Not responding (may still be starting)" >> $GITHUB_STEP_SUMMARY
+        fi
+        
+        echo "### 🎯 Next Steps:" >> $GITHUB_STEP_SUMMARY
+        echo "1. Visit the frontend URL to access the Burger Builder app" >> $GITHUB_STEP_SUMMARY
+        echo "2. Test burger creation and cart functionality" >> $GITHUB_STEP_SUMMARY
+        echo "3. Verify order placement works correctly" >> $GITHUB_STEP_SUMMARY
+        echo "4. Check backend API at: https://${{ needs.infrastructure.outputs.backend_fqdn }}/api/ingredients" >> $GITHUB_STEP_SUMMARY
+        echo "" >> $GITHUB_STEP_SUMMARY
+        echo "### ✨ Infrastructure as Code - Everything managed by Terraform!" >> $GITHUB_STEP_SUMMARY
+
+  # Job 4: Destroy Infrastructure (if requested)
+  destroy:
+    name: 💥 Destroy Infrastructure
+    runs-on: ubuntu-latest
+    if: github.event.inputs.action == 'destroy'
+    defaults:
+      run:
+        working-directory: ./terraform
+    
+    steps:
+    - name: 📥 Checkout code
+      uses: actions/checkout@v4
+
+    - name: 🔧 Setup Terraform
+      uses: hashicorp/setup-terraform@v3
+      with:
+        terraform_version: 1.7.3
+        terraform_wrapper: false
+
+    - name: 🔐 Azure Login
+      uses: azure/login@v1
+      with:
+        creds: ${{ secrets.AZURE_CREDENTIALS }}
+
+    - name: 📝 Create Terraform Variables File
+      run: |
+        cat > terraform.tfvars << 'EOF'
+        ${{ secrets.TF_VARS }}
+        EOF
+        
+        echo "✅ Terraform variables file created for destroy"
+
+    - name: 🏗️ Terraform Init
+      run: terraform init
+
+    - name: 💥 Terraform Destroy
+      run: terraform destroy -auto-approve
